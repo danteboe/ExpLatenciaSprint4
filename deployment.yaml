@@ -1,64 +1,155 @@
-apiVersion: v1
-kind: Service
-metadata:
-  name: django-service
-spec:
-  selector:
-    app: django
-  ports:
-    - protocol: TCP
-      port: 80
-      targetPort: 8080
-  type: LoadBalancer
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: django-deployment
-spec:
-  replicas: 2  # para simular el balanceador
-  selector:
-    matchLabels:
-      app: django
-  template:
+# Latency experiment deployment
+resources:
+# Firewall rules
+- name: latencia-firewall-django
+  type: compute.v1.firewall
+  properties:
+    network: $(ref.default.selfLink)
+    priority: 1000
+    direction: INGRESS
+    sourceRanges: 
+    - 0.0.0.0/0
+    targetTags:
+    - rest-django
+    allowed:
+    - IPProtocol: TCP
+      ports: 
+      - 8080
+
+# Redis instance for caching
+- type: compute.v1.instance
+  name: vm-redis-cache
+  properties:
+    zone: us-central1-a
+    machineType: zones/us-central1-a/machineTypes/e2-medium
+    disks:
+    - deviceName: boot
+      type: PERSISTENT
+      boot: true
+      autoDelete: true
+      initializeParams:
+        sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+    networkInterfaces:
+    - network: global/networks/default
+      accessConfigs:
+      - name: External NAT
+        type: ONE_TO_ONE_NAT
+    tags:
+      items: 
+      - redis-cache
     metadata:
-      labels:
-        app: django
-    spec:
-      containers:
-        - name: django
-          image: gcr.io/talleres-arquisoftbot/django:latest # por ejemplo gcr.io/mi-proyecto/django:latest
-          ports:
-            - containerPort: 8080
-          env:
-            - name: REDIS_HOST
-              value: "redis"
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: redis
-spec:
-  ports:
-    - port: 6379
-  selector:
-    app: redis
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: redis-deployment
-spec:
-  selector:
-    matchLabels:
-      app: redis
-  template:
+      items:
+      - key: startup-script
+        value: |
+          #!/bin/bash
+          sudo apt-get update
+          sudo apt-get install -y redis-server
+          sudo sed -i 's/bind 127.0.0.1 ::1/bind 0.0.0.0/g' /etc/redis/redis.conf
+          sudo sed -i 's/protected-mode yes/protected-mode no/g' /etc/redis/redis.conf
+          sudo systemctl restart redis-server
+
+# Django instance 1 (for load balancing)
+- type: compute.v1.instance
+  name: vm-reporte-clinico-1
+  properties:
+    zone: us-central1-a
+    machineType: zones/us-central1-a/machineTypes/e2-medium
+    disks:
+    - deviceName: boot
+      type: PERSISTENT
+      boot: true
+      autoDelete: true
+      initializeParams:
+        sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+    networkInterfaces:
+    - network: global/networks/default
+      accessConfigs:
+      - name: External NAT
+        type: ONE_TO_ONE_NAT
+    tags:
+      items: 
+      - rest-django
     metadata:
-      labels:
-        app: redis
-    spec:
-      containers:
-        - name: redis
-          image: redis:6.2
-          ports:
-            - containerPort: 6379
+      items:
+      - key: startup-script
+        value: |
+          #!/bin/bash
+          sudo apt-get update
+          sudo apt-get install -y python3-pip git
+          sudo mkdir -p /app
+          cd /app
+          git clone https://github.com/danteboe/ExpLatenciaSprint4.git .
+          echo "from .views import generar_reporte_clinico" | cat - urls.py > temp && mv temp urls.py
+          sed -i "s/ALLOWED_HOSTS = \[\]/ALLOWED_HOSTS = \['*'\]/" settings.py
+          sed -i "s|redis://redis:6379/1|redis://$(gcloud compute instances describe vm-redis-cache --zone=us-central1-a --format='get(networkInterfaces[0].networkIP)'):6379/1|g" settings.py
+          pip3 install django==3.2.6 redis==4.5.1 django-redis==5.2.0
+          python3 manage.py runserver 0.0.0.0:8080
+
+# Django instance 2 (for load balancing)
+- type: compute.v1.instance
+  name: vm-reporte-clinico-2
+  properties:
+    zone: us-central1-a
+    machineType: zones/us-central1-a/machineTypes/e2-medium
+    disks:
+    - deviceName: boot
+      type: PERSISTENT
+      boot: true
+      autoDelete: true
+      initializeParams:
+        sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+    networkInterfaces:
+    - network: global/networks/default
+      accessConfigs:
+      - name: External NAT
+        type: ONE_TO_ONE_NAT
+    tags:
+      items: 
+      - rest-django
+    metadata:
+      items:
+      - key: startup-script
+        value: |
+          #!/bin/bash
+          sudo apt-get update
+          sudo apt-get install -y python3-pip git
+          sudo mkdir -p /app
+          cd /app
+          git clone [YOUR_REPOSITORY_URL] .
+          echo "from .views import generar_reporte_clinico" | cat - urls.py > temp && mv temp urls.py
+          sed -i "s/ALLOWED_HOSTS = \[\]/ALLOWED_HOSTS = \['*'\]/" settings.py
+          sed -i "s|redis://redis:6379/1|redis://$(gcloud compute instances describe vm-redis-cache --zone=us-central1-a --format='get(networkInterfaces[0].networkIP)'):6379/1|g" settings.py
+          pip3 install django==3.2.6 redis==4.5.1 django-redis==5.2.0
+          python3 manage.py runserver 0.0.0.0:8080
+
+# Load Balancer
+- type: compute.v1.regionBackendService
+  name: latencia-backend-service
+  properties:
+    region: us-central1
+    backends:
+    - group: $(ref.latencia-instance-group.selfLink)
+    healthChecks:
+    - $(ref.latencia-health-check.selfLink)
+    protocol: HTTP
+    portName: http
+
+- type: compute.v1.regionHealthCheck
+  name: latencia-health-check
+  properties:
+    region: us-central1
+    type: HTTP
+    httpHealthCheck:
+      port: 8080
+      requestPath: /api/reporte/1/
+
+- type: compute.v1.instanceGroup
+  name: latencia-instance-group
+  properties:
+    zone: us-central1-a
+    instances:
+    - $(ref.vm-reporte-clinico-1.selfLink)
+    - $(ref.vm-reporte-clinico-2.selfLink)
+    namedPorts:
+    - name: http
+      port: 8080
