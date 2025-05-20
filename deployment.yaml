@@ -16,12 +16,28 @@ resources:
       ports: 
       - 8080
 
+# Firewall rule for database connections
+- name: latencia-firewall-db
+  type: compute.v1.firewall
+  properties:
+    network: $(ref.default.selfLink)
+    priority: 1000
+    direction: INGRESS
+    sourceRanges: 
+    - 0.0.0.0/0
+    targetTags:
+    - database
+    allowed:
+    - IPProtocol: TCP
+      ports: 
+      - 5432
+
 # Redis instance for caching
 - type: compute.v1.instance
   name: vm-redis-cache
   properties:
     zone: us-central1-a
-    machineType: zones/us-central1-a/machineTypes/e2-medium
+    machineType: zones/us-central1-a/machineTypes/custom-3-6144
     disks:
     - deviceName: boot
       type: PERSISTENT
@@ -48,12 +64,94 @@ resources:
           sudo sed -i 's/protected-mode yes/protected-mode no/g' /etc/redis/redis.conf
           sudo systemctl restart redis-server
 
+# Database instance 1
+- type: compute.v1.instance
+  name: vm-db-1
+  properties:
+    zone: us-central1-a
+    machineType: zones/us-central1-a/machineTypes/custom-3-6144 # 3 vCPU, 6GB RAM
+    disks:
+    - deviceName: boot
+      type: PERSISTENT
+      boot: true
+      autoDelete: true
+      initializeParams:
+        sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+    networkInterfaces:
+    - network: global/networks/default
+      accessConfigs:
+      - name: External NAT
+        type: ONE_TO_ONE_NAT
+    tags:
+      items: 
+      - database
+    metadata:
+      items:
+      - key: startup-script
+        value: |
+          #!/bin/bash
+          sudo apt-get update
+          sudo apt-get install -y postgresql postgresql-contrib
+          
+          # Configure PostgreSQL to accept connections
+          sudo -u postgres bash -c "echo \"listen_addresses = '*'\" >> /etc/postgresql/12/main/postgresql.conf"
+          sudo -u postgres bash -c "echo \"host all all 0.0.0.0/0 md5\" >> /etc/postgresql/12/main/pg_hba.conf"
+          
+          # Create database and user
+          sudo -u postgres psql -c "CREATE DATABASE clinico;"
+          sudo -u postgres psql -c "CREATE USER django WITH PASSWORD 'password123';"
+          sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE clinico TO django;"
+          
+          # Restart PostgreSQL
+          sudo systemctl restart postgresql
+
+# Database instance 2
+- type: compute.v1.instance
+  name: vm-db-2
+  properties:
+    zone: us-central1-a
+    machineType: zones/us-central1-a/machineTypes/custom-3-6144 # 3 vCPU, 6GB RAM
+    disks:
+    - deviceName: boot
+      type: PERSISTENT
+      boot: true
+      autoDelete: true
+      initializeParams:
+        sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+    networkInterfaces:
+    - network: global/networks/default
+      accessConfigs:
+      - name: External NAT
+        type: ONE_TO_ONE_NAT
+    tags:
+      items: 
+      - database
+    metadata:
+      items:
+      - key: startup-script
+        value: |
+          #!/bin/bash
+          sudo apt-get update
+          sudo apt-get install -y postgresql postgresql-contrib
+          
+          # Configure PostgreSQL to accept connections
+          sudo -u postgres bash -c "echo \"listen_addresses = '*'\" >> /etc/postgresql/12/main/postgresql.conf"
+          sudo -u postgres bash -c "echo \"host all all 0.0.0.0/0 md5\" >> /etc/postgresql/12/main/pg_hba.conf"
+          
+          # Create database and user
+          sudo -u postgres psql -c "CREATE DATABASE clinico;"
+          sudo -u postgres psql -c "CREATE USER django WITH PASSWORD 'password123';"
+          sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE clinico TO django;"
+          
+          # Restart PostgreSQL
+          sudo systemctl restart postgresql
+
 # Django instance 1 (for load balancing)
 - type: compute.v1.instance
   name: vm-reporte-clinico-1
   properties:
     zone: us-central1-a
-    machineType: zones/us-central1-a/machineTypes/e2-medium
+    machineType: zones/us-central1-a/machineTypes/custom-3-6144 # 3 vCPU, 6GB RAM
     disks:
     - deviceName: boot
       type: PERSISTENT
@@ -75,14 +173,91 @@ resources:
         value: |
           #!/bin/bash
           sudo apt-get update
-          sudo apt-get install -y python3-pip git
+          sudo apt-get install -y python3-pip git python3-dev libpq-dev
           sudo mkdir -p /app
           cd /app
           git clone https://github.com/danteboe/ExpLatenciaSprint4.git .
-          echo "from .views import generar_reporte_clinico" | cat - urls.py > temp && mv temp urls.py
-          sed -i "s/ALLOWED_HOSTS = \[\]/ALLOWED_HOSTS = \['*'\]/" settings.py
+          
+          # Add multi-db config to settings.py
+          cat > db_config.py << 'EOF'
+          
+          # Updated database configuration with multiple databases
+          DATABASES = {
+              'default': {
+                  'ENGINE': 'django.db.backends.postgresql',
+                  'NAME': 'clinico',
+                  'USER': 'django',
+                  'PASSWORD': 'password123',
+                  'HOST': '$(gcloud compute instances describe vm-db-1 --zone=us-central1-a --format='get(networkInterfaces[0].networkIP)')',
+                  'PORT': '5432',
+              },
+              'replica': {
+                  'ENGINE': 'django.db.backends.postgresql',
+                  'NAME': 'clinico',
+                  'USER': 'django',
+                  'PASSWORD': 'password123',
+                  'HOST': '$(gcloud compute instances describe vm-db-2 --zone=us-central1-a --format='get(networkInterfaces[0].networkIP)')',
+                  'PORT': '5432',
+              }
+          }
+          
+          # Database router configuration
+          DATABASE_ROUTERS = ['latencia.dbrouter.PrimaryReplicaRouter']
+          EOF
+          
+          # Create database router
+          mkdir -p latencia
+          cat > latencia/dbrouter.py << 'EOF'
+          class PrimaryReplicaRouter:
+              """
+              Database router that sends reads to replica and writes to primary DB
+              """
+              
+              def db_for_read(self, model, **hints):
+                  """
+                  Reads go to replica DB
+                  """
+                  return 'replica'
+                  
+              def db_for_write(self, model, **hints):
+                  """
+                  Writes always go to default (primary) DB
+                  """
+                  return 'default'
+                  
+              def allow_relation(self, obj1, obj2, **hints):
+                  """
+                  Allow relations between objects in any database
+                  """
+                  return True
+                  
+              def allow_migrate(self, db, app_label, model_name=None, **hints):
+                  """
+                  All models end up in both databases
+                  """
+                  return True
+          EOF
+          
+          # Configure Redis cache
           sed -i "s|redis://redis:6379/1|redis://$(gcloud compute instances describe vm-redis-cache --zone=us-central1-a --format='get(networkInterfaces[0].networkIP)'):6379/1|g" settings.py
-          pip3 install django==3.2.6 redis==4.5.1 django-redis==5.2.0
+          
+          # Update settings.py with database configuration
+          python3 -c "import os; content = open('settings.py', 'r').read(); content = content.replace('DATABASES = {\\n    \\'default\\': {\\n        \\'ENGINE\\': \\'django.db.backends.sqlite3\\',\\n        \\'NAME\\': BASE_DIR / \\'db.sqlite3\\',\\n    }\\n}', open('db_config.py', 'r').read()); open('settings.py', 'w').write(content)"
+          
+          # Add generar_reporte_clinico to urls
+          grep -q "from .views import generar_reporte_clinico" urls.py || echo "from .views import generar_reporte_clinico" | cat - urls.py > temp && mv temp urls.py
+          
+          # Update ALLOWED_HOSTS
+          sed -i "s/ALLOWED_HOSTS = \[\]/ALLOWED_HOSTS = \['*'\]/" settings.py
+          
+          # Install required packages
+          pip3 install django==3.2.6 redis==4.5.1 django-redis==5.2.0 psycopg2
+          
+          # Run migrations
+          python3 manage.py makemigrations
+          python3 manage.py migrate
+          
+          # Start Django server
           python3 manage.py runserver 0.0.0.0:8080
 
 # Django instance 2 (for load balancing)
@@ -90,7 +265,7 @@ resources:
   name: vm-reporte-clinico-2
   properties:
     zone: us-central1-a
-    machineType: zones/us-central1-a/machineTypes/e2-medium
+    machineType: zones/us-central1-a/machineTypes/custom-3-6144 # 3 vCPU, 6GB RAM
     disks:
     - deviceName: boot
       type: PERSISTENT
@@ -112,37 +287,103 @@ resources:
         value: |
           #!/bin/bash
           sudo apt-get update
-          sudo apt-get install -y python3-pip git
+          sudo apt-get install -y python3-pip git python3-dev libpq-dev
           sudo mkdir -p /app
           cd /app
-          git clone [YOUR_REPOSITORY_URL] .
-          echo "from .views import generar_reporte_clinico" | cat - urls.py > temp && mv temp urls.py
-          sed -i "s/ALLOWED_HOSTS = \[\]/ALLOWED_HOSTS = \['*'\]/" settings.py
+          git clone https://github.com/danteboe/ExpLatenciaSprint4.git .
+          
+          # Add multi-db config to settings.py
+          cat > db_config.py << 'EOF'
+          
+          # Updated database configuration with multiple databases
+          DATABASES = {
+              'default': {
+                  'ENGINE': 'django.db.backends.postgresql',
+                  'NAME': 'clinico',
+                  'USER': 'django',
+                  'PASSWORD': 'password123',
+                  'HOST': '$(gcloud compute instances describe vm-db-1 --zone=us-central1-a --format='get(networkInterfaces[0].networkIP)')',
+                  'PORT': '5432',
+              },
+              'replica': {
+                  'ENGINE': 'django.db.backends.postgresql',
+                  'NAME': 'clinico',
+                  'USER': 'django',
+                  'PASSWORD': 'password123',
+                  'HOST': '$(gcloud compute instances describe vm-db-2 --zone=us-central1-a --format='get(networkInterfaces[0].networkIP)')',
+                  'PORT': '5432',
+              }
+          }
+          
+          # Database router configuration
+          DATABASE_ROUTERS = ['latencia.dbrouter.PrimaryReplicaRouter']
+          EOF
+          
+          # Create database router
+          mkdir -p latencia
+          cat > latencia/dbrouter.py << 'EOF'
+          class PrimaryReplicaRouter:
+              """
+              Database router that sends reads to replica and writes to primary DB
+              """
+              
+              def db_for_read(self, model, **hints):
+                  """
+                  Reads go to replica DB
+                  """
+                  return 'replica'
+                  
+              def db_for_write(self, model, **hints):
+                  """
+                  Writes always go to default (primary) DB
+                  """
+                  return 'default'
+                  
+              def allow_relation(self, obj1, obj2, **hints):
+                  """
+                  Allow relations between objects in any database
+                  """
+                  return True
+                  
+              def allow_migrate(self, db, app_label, model_name=None, **hints):
+                  """
+                  All models end up in both databases
+                  """
+                  return True
+          EOF
+          
+          # Configure Redis cache
           sed -i "s|redis://redis:6379/1|redis://$(gcloud compute instances describe vm-redis-cache --zone=us-central1-a --format='get(networkInterfaces[0].networkIP)'):6379/1|g" settings.py
-          pip3 install django==3.2.6 redis==4.5.1 django-redis==5.2.0
+          
+          # Update settings.py with database configuration
+          python3 -c "import os; content = open('settings.py', 'r').read(); content = content.replace('DATABASES = {\\n    \\'default\\': {\\n        \\'ENGINE\\': \\'django.db.backends.sqlite3\\',\\n        \\'NAME\\': BASE_DIR / \\'db.sqlite3\\',\\n    }\\n}', open('db_config.py', 'r').read()); open('settings.py', 'w').write(content)"
+          
+          # Add generar_reporte_clinico to urls
+          grep -q "from .views import generar_reporte_clinico" urls.py || echo "from .views import generar_reporte_clinico" | cat - urls.py > temp && mv temp urls.py
+          
+          # Update ALLOWED_HOSTS
+          sed -i "s/ALLOWED_HOSTS = \[\]/ALLOWED_HOSTS = \['*'\]/" settings.py
+          
+          # Install required packages
+          pip3 install django==3.2.6 redis==4.5.1 django-redis==5.2.0 psycopg2
+          
+          # Run migrations
+          python3 manage.py makemigrations
+          python3 manage.py migrate
+          
+          # Start Django server
           python3 manage.py runserver 0.0.0.0:8080
 
-# Load Balancer
-- type: compute.v1.regionBackendService
-  name: latencia-backend-service
-  properties:
-    region: us-central1
-    backends:
-    - group: $(ref.latencia-instance-group.selfLink)
-    healthChecks:
-    - $(ref.latencia-health-check.selfLink)
-    protocol: HTTP
-    portName: http
-
-- type: compute.v1.regionHealthCheck
+# Load Balancer health check
+- type: compute.v1.healthCheck
   name: latencia-health-check
   properties:
-    region: us-central1
     type: HTTP
     httpHealthCheck:
       port: 8080
       requestPath: /api/reporte/1/
 
+# Instance group for load balancing
 - type: compute.v1.instanceGroup
   name: latencia-instance-group
   properties:
@@ -153,3 +394,34 @@ resources:
     namedPorts:
     - name: http
       port: 8080
+
+# Backend service for load balancer
+- type: compute.v1.backendService
+  name: latencia-backend-service
+  properties:
+    healthChecks:
+    - $(ref.latencia-health-check.selfLink)
+    backends:
+    - group: $(ref.latencia-instance-group.selfLink)
+    protocol: HTTP
+    portName: http
+
+# URL map to route requests to backend
+- type: compute.v1.urlMap
+  name: latencia-url-map
+  properties:
+    defaultService: $(ref.latencia-backend-service.selfLink)
+
+# HTTP proxy to handle requests
+- type: compute.v1.targetHttpProxy
+  name: latencia-http-proxy
+  properties:
+    urlMap: $(ref.latencia-url-map.selfLink)
+
+# Global forwarding rule for HTTP
+- type: compute.v1.globalForwardingRule
+  name: latencia-http-forwarding-rule
+  properties:
+    target: $(ref.latencia-http-proxy.selfLink)
+    portRange: 80
+    IPProtocol: TCP
