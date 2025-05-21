@@ -30,38 +30,6 @@ resources:
       ports:
       - 5432
 
-# Redis instance
-- type: compute.v1.instance
-  name: vm-redis-cache
-  properties:
-    zone: us-west1-a
-    machineType: zones/us-west1-a/machineTypes/custom-4-6144
-    disks:
-    - deviceName: boot
-      type: PERSISTENT
-      boot: true
-      autoDelete: true
-      initializeParams:
-        sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
-    networkInterfaces:
-    - network: global/networks/default
-      accessConfigs:
-      - name: External NAT
-        type: ONE_TO_ONE_NAT
-    tags:
-      items:
-      - redis-cache
-    metadata:
-      items:
-      - key: startup-script
-        value: |
-          #!/bin/bash
-          sudo apt-get update
-          sudo apt-get install -y redis-server
-          sudo sed -i 's/^bind .*/bind 0.0.0.0/' /etc/redis/redis.conf
-          sudo sed -i 's/^protected-mode yes/protected-mode no/' /etc/redis/redis.conf
-          sudo systemctl restart redis-server
-
 # DB Primary
 - type: compute.v1.instance
   name: vm-db-primary
@@ -246,8 +214,6 @@ resources:
         value: $(ref.vm-db-primary.networkInterfaces[0].networkIP)
       - key: db-replica-ip
         value: $(ref.vm-db-replica.networkInterfaces[0].networkIP)
-      - key: redis-ip
-        value: $(ref.vm-redis-cache.networkInterfaces[0].networkIP)
 
 # VM reporte clinico 2
 - type: compute.v1.instance
@@ -260,5 +226,3 @@ resources:
         value: $(ref.vm-db-primary.networkInterfaces[0].networkIP)
       - key: db-replica-ip
         value: $(ref.vm-db-replica.networkInterfaces[0].networkIP)
-      - key: redis-ip
-        value: $(ref.vm-redis-cache.networkInterfaces[0].networkIP)

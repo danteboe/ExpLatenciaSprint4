@@ -1,14 +1,22 @@
-from django.views.decorators.cache import cache_page
 from django.http import JsonResponse
 import time
 
-@cache_page(60 * 5)  # cache por 5 minutos
+# Simple dictionary cache
+report_cache = {}
+
 def generar_reporte_clinico(request, paciente_id):
-    # Simulación de carga
-    time.sleep(2)  # Simula un proceso costoso (sin caché)
+    # Check if result is in cache
+    if paciente_id in report_cache:
+        return JsonResponse(report_cache[paciente_id])
+    
+    # Simulate expensive process
+    time.sleep(2)  # Simulates costly process
 
     reporte = {
         "paciente_id": paciente_id,
         "reporte": "Resumen clínico generado automáticamente"
     }
+    
+    # Store in cache
+    report_cache[paciente_id] = reporte
     return JsonResponse(reporte)
