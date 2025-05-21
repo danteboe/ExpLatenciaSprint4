@@ -38,6 +38,9 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'database',  # Aplicación para manejar la base de datos
+    'load_balancer',  # Aplicación para manejar el balanceador de carga
+    'patient_manager',  # Aplicación para manejar los pacientes
 ]
 
 MIDDLEWARE = [

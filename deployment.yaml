@@ -1,5 +1,5 @@
 resources:
-# Firewall rules
+# Reglas de firewall para Django
 - name: latencia-firewall-django
   type: compute.v1.firewall
   properties:
@@ -15,6 +15,7 @@ resources:
       ports:
       - 8080
 
+# Reglas de firewall para base de datos
 - name: latencia-firewall-db
   type: compute.v1.firewall
   properties:
@@ -30,7 +31,7 @@ resources:
       ports:
       - 5432
 
-# DB Primary
+# Base de datos primaria
 - type: compute.v1.instance
   name: vm-db-primary
   properties:
@@ -56,8 +57,11 @@ resources:
       - key: startup-script
         value: |
           #!/bin/bash
+          # Actualizar e instalar dependencias
           sudo apt-get update
-          sudo apt-get install -y postgresql postgresql-contrib
+          sudo apt-get install -y python3-pip git python3-dev libpq-dev postgresql postgresql-contrib
+
+          # Configurar PostgreSQL
           sudo -u postgres bash -c "echo \"listen_addresses = '*'\" >> /etc/postgresql/12/main/postgresql.conf"
           sudo -u postgres bash -c "echo \"host all all 0.0.0.0/0 md5\" >> /etc/postgresql/12/main/pg_hba.conf"
           sudo systemctl restart postgresql
@@ -65,7 +69,30 @@ resources:
           sudo -u postgres psql -c "CREATE USER django WITH PASSWORD 'password123';"
           sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE clinico TO django;"
 
-# DB Replica
+          # Clonar el repositorio
+          sudo mkdir -p /app
+          cd /app
+          git clone https://github.com/danteboe/ExpLatenciaSprint4.git .
+
+          # Configurar urls.py para ejecutar solo el app 'database'
+          cat > explatenciasprint4/urls.py << 'EOF'
+          from django.urls import path, include
+          urlpatterns = [
+              path('', include('database.urls')),
+          ]
+          EOF
+
+          # Configurar settings.py
+          sed -i "s/^ALLOWED_HOSTS = .*/ALLOWED_HOSTS = ['*']/" explatenciasprint4/settings.py
+
+          # Instalar dependencias de Python
+          pip3 install -r requirements.txt
+          python3 manage.py migrate
+
+          # Ejecutar la aplicación 'database'
+          python3 manage.py runserver 0.0.0.0:8080
+
+# Base de datos secundaria (réplica)
 - type: compute.v1.instance
   name: vm-db-replica
   properties:
@@ -91,8 +118,11 @@ resources:
       - key: startup-script
         value: |
           #!/bin/bash
+          # Actualizar e instalar dependencias
           sudo apt-get update
-          sudo apt-get install -y postgresql postgresql-contrib
+          sudo apt-get install -y python3-pip git python3-dev libpq-dev postgresql postgresql-contrib
+
+          # Configurar PostgreSQL
           sudo -u postgres bash -c "echo \"listen_addresses = '*'\" >> /etc/postgresql/12/main/postgresql.conf"
           sudo -u postgres bash -c "echo \"host all all 0.0.0.0/0 md5\" >> /etc/postgresql/12/main/pg_hba.conf"
           sudo systemctl restart postgresql
@@ -100,10 +130,33 @@ resources:
           sudo -u postgres psql -c "CREATE USER django WITH PASSWORD 'password123';"
           sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE clinico TO django;"
 
-# Django instance template
+          # Clonar el repositorio
+          sudo mkdir -p /app
+          cd /app
+          git clone https://github.com/danteboe/ExpLatenciaSprint4.git .
+
+          # Configurar urls.py para ejecutar solo el app 'database'
+          cat > explatenciasprint4/urls.py << 'EOF'
+          from django.urls import path, include
+          urlpatterns = [
+              path('', include('database.urls')),
+          ]
+          EOF
+
+          # Configurar settings.py
+          sed -i "s/^ALLOWED_HOSTS = .*/ALLOWED_HOSTS = ['*']/" explatenciasprint4/settings.py
+
+          # Instalar dependencias de Python
+          pip3 install -r requirements.txt
+          python3 manage.py migrate
+
+          # Ejecutar la aplicación 'database'
+          python3 manage.py runserver 0.0.0.0:8080
+
+# Plantilla para instancias Django (load_balancer)
 - name: django-instance
   type: compute.v1.instance
-  properties: &django-instance
+  properties:
     zone: us-west1-a
     machineType: zones/us-west1-a/machineTypes/custom-4-6144
     disks:
@@ -126,19 +179,96 @@ resources:
       - key: startup-script
         value: |
           #!/bin/bash
+          # Actualizar e instalar dependencias
           sudo apt-get update
           sudo apt-get install -y python3-pip git python3-dev libpq-dev
 
+          # Clonar el repositorio
           sudo mkdir -p /app
           cd /app
           git clone https://github.com/danteboe/ExpLatenciaSprint4.git .
 
+          # Configurar urls.py para ejecutar solo el app 'load_balancer'
+          cat > explatenciasprint4/urls.py << 'EOF'
+          from django.urls import path, include
+          urlpatterns = [
+              path('', include('load_balancer.urls')),
+          ]
+          EOF
+
+          # Obtener IPs de las instancias de patient_manager
+          REPORTE_1_IP=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/reporte-1-ip)
+          REPORTE_2_IP=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/reporte-2-ip)
+
+          # Configurar las instancias en load_balancer/views.py
+          sed -i "s|INSTANCES = .*|INSTANCES = ['http://${REPORTE_1_IP}:8080', 'http://${REPORTE_2_IP}:8080']|" load_balancer/views.py
+
+          # Configurar settings.py
+          sed -i "s/^ALLOWED_HOSTS = .*/ALLOWED_HOSTS = ['*']/" explatenciasprint4/settings.py
+
+          # Instalar dependencias de Python
+          pip3 install -r requirements.txt
+          python3 manage.py migrate
+
+          # Ejecutar la aplicación 'load_balancer'
+          python3 manage.py runserver 0.0.0.0:8080
+      - key: reporte-1-ip
+        value: $(ref.vm-reporte-clinico-1.networkInterfaces[0].networkIP)
+      - key: reporte-2-ip
+        value: $(ref.vm-reporte-clinico-2.networkInterfaces[0].networkIP)
+
+# VM reporte clinico 1 (patient_manager)
+- type: compute.v1.instance
+  name: vm-reporte-clinico-1
+  properties:
+    zone: us-west1-a
+    machineType: zones/us-west1-a/machineTypes/custom-4-6144
+    disks:
+    - deviceName: boot
+      type: PERSISTENT
+      boot: true
+      autoDelete: true
+      initializeParams:
+        sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+    networkInterfaces:
+    - network: global/networks/default
+      accessConfigs:
+      - name: External NAT
+        type: ONE_TO_ONE_NAT
+    tags:
+      items:
+      - rest-django
+    metadata:
+      items:
+      - key: startup-script
+        value: |
+          #!/bin/bash
+          # Actualizar e instalar dependencias
+          sudo apt-get update
+          sudo apt-get install -y python3-pip git python3-dev libpq-dev
+
+          # Clonar el repositorio
+          sudo mkdir -p /app
+          cd /app
+          git clone https://github.com/danteboe/ExpLatenciaSprint4.git .
+
+          # Configurar urls.py para ejecutar solo el app 'patient_manager'
+          cat > explatenciasprint4/urls.py << 'EOF'
+          from django.urls import path, include
+          urlpatterns = [
+              path('', include('patient_manager.urls')),
+          ]
+          EOF
+
+          # Obtener IPs de las bases de datos
           DB_PRIMARY_IP=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/db-primary-ip)
           DB_REPLICA_IP=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/db-replica-ip)
-          REDIS_IP=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/redis-ip)
 
-          # Crear db_config.py
-          cat > db_config.py << EOF
+          # Configurar la URL de la base de datos en patient_manager/views.py
+          sed -i "s|DB_API_URL = .*|DB_API_URL = 'http://${DB_PRIMARY_IP}:8080/api/report/'|" patient_manager/views.py
+
+          # Crear db_config.py para configuración de bases de datos
+          cat > explatenciasprint4/db_config.py << 'EOF'
           DATABASES = {
               'default': {
                   'ENGINE': 'django.db.backends.postgresql',
@@ -157,14 +287,15 @@ resources:
                   'PORT': '5432',
               },
           }
-          DATABASE_ROUTERS = ['latencia.dbrouter.PrimaryReplicaRouter']
+          DATABASE_ROUTERS = ['explatenciasprint4.dbrouter.PrimaryReplicaRouter']
           EOF
 
-          mkdir -p latencia
-          cat > latencia/dbrouter.py << 'EOF'
+          # Crear el enrutador de base de datos
+          mkdir -p explatenciasprint4
+          cat > explatenciasprint4/dbrouter.py << 'EOF'
           class PrimaryReplicaRouter:
               """
-              Database router that sends reads to replica and writes to primary DB
+              Enrutador de base de datos que envía lecturas a la réplica y escrituras a la primaria
               """
               def db_for_read(self, model, **hints):
                   return 'replica'
@@ -176,52 +307,151 @@ resources:
                   return True
           EOF
 
-          sed -i "s|redis://redis:6379/1|redis://${REDIS_IP}:6379/1|g" settings.py
-
-          # Script Python para reemplazar bloque DATABASES
+          # Reemplazar el bloque DATABASES en settings.py
           cat > replace_databases.py << 'PYEOF'
           import re
-          with open('settings.py') as f:
+          with open('explatenciasprint4/settings.py') as f:
               content = f.read()
-          with open('db_config.py') as f:
+          with open('explatenciasprint4/db_config.py') as f:
               db_conf = f.read()
           pattern = re.compile(r'DATABASES\s*=\s*\{.*?\}\s*', re.DOTALL)
           content_new = pattern.sub(db_conf + '\n', content)
-          with open('settings.py', 'w') as f:
+          with open('explatenciasprint4/settings.py', 'w') as f:
               f.write(content_new)
           PYEOF
 
           python3 replace_databases.py
           rm replace_databases.py
 
-          # Insertar import si no existe
-          grep -q "from .views import generar_reporte_clinico" urls.py || sed -i '1i from .views import generar_reporte_clinico' urls.py
+          # Configurar settings.py
+          sed -i "s/^ALLOWED_HOSTS = .*/ALLOWED_HOSTS = ['*']/" explatenciasprint4/settings.py
 
-          sed -i "s/^ALLOWED_HOSTS = .*/ALLOWED_HOSTS = ['*']/" settings.py
-
+          # Instalar dependencias de Python
           pip3 install -r requirements.txt
           python3 manage.py migrate
-          python3 manage.py runserver 0.0.0.0:8080
 
-# VM reporte clinico 1
-- type: compute.v1.instance
-  name: vm-reporte-clinico-1
-  properties:
-    <<: *django-instance
-    metadata:
-      items:
+          # Ejecutar la aplicación 'patient_manager'
+          python3 manage.py runserver 0.0.0.0:8080
       - key: db-primary-ip
         value: $(ref.vm-db-primary.networkInterfaces[0].networkIP)
       - key: db-replica-ip
         value: $(ref.vm-db-replica.networkInterfaces[0].networkIP)
 
-# VM reporte clinico 2
+# VM reporte clinico 2 (patient_manager)
 - type: compute.v1.instance
   name: vm-reporte-clinico-2
   properties:
-    <<: *django-instance
+    zone: us-west1-a
+    machineType: zones/us-west1-a/machineTypes/custom-4-6144
+    disks:
+    - deviceName: boot
+      type: PERSISTENT
+      boot: true
+      autoDelete: true
+      initializeParams:
+        sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+    networkInterfaces:
+    - network: global/networks/default
+      accessConfigs:
+      - name: External NAT
+        type: ONE_TO_ONE_NAT
+    tags:
+      items:
+      - rest-django
     metadata:
       items:
+      - key: startup-script
+        value: |
+          #!/bin/bash
+          # Actualizar e instalar dependencias
+          sudo apt-get update
+          sudo apt-get install -y python3-pip git python3-dev libpq-dev
+
+          # Clonar el repositorio
+          sudo mkdir -p /app
+          cd /app
+          git clone https://github.com/danteboe/ExpLatenciaSprint4.git .
+
+          # Configurar urls.py para ejecutar solo el app 'patient_manager'
+          cat > explatenciasprint4/urls.py << 'EOF'
+          from django.urls import path, include
+          urlpatterns = [
+              path('', include('patient_manager.urls')),
+          ]
+          EOF
+
+          # Obtener IPs de las bases de datos
+          DB_PRIMARY_IP=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/db-primary-ip)
+          DB_REPLICA_IP=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/db-replica-ip)
+
+          # Configurar la URL de la base de datos en patient_manager/views.py
+          sed -i "s|DB_API_URL = .*|DB_API_URL = 'http://${DB_PRIMARY_IP}:8080/api/report/'|" patient_manager/views.py
+
+          # Crear db_config.py para configuración de bases de datos
+          cat > explatenciasprint4/db_config.py << 'EOF'
+          DATABASES = {
+              'default': {
+                  'ENGINE': 'django.db.backends.postgresql',
+                  'NAME': 'clinico',
+                  'USER': 'django',
+                  'PASSWORD': 'password123',
+                  'HOST': '${DB_PRIMARY_IP}',
+                  'PORT': '5432',
+              },
+              'replica': {
+                  'ENGINE': 'django.db.backends.postgresql',
+                  'NAME': 'clinico',
+                  'USER': 'django',
+                  'PASSWORD': 'password123',
+                  'HOST': '${DB_REPLICA_IP}',
+                  'PORT': '5432',
+              },
+          }
+          DATABASE_ROUTERS = ['explatenciasprint4.dbrouter.PrimaryReplicaRouter']
+          EOF
+
+          # Crear el enrutador de base de datos
+          mkdir -p explatenciasprint4
+          cat > explatenciasprint4/dbrouter.py << 'EOF'
+          class PrimaryReplicaRouter:
+              """
+              Enrutador de base de datos que envía lecturas a la réplica y escrituras a la primaria
+              """
+              def db_for_read(self, model, **hints):
+                  return 'replica'
+              def db_for_write(self, model, **hints):
+                  return 'default'
+              def allow_relation(self, obj1, obj2, **hints):
+                  return True
+              def allow_migrate(self, db, app_label, model_name=None, **hints):
+                  return True
+          EOF
+
+          # Reemplazar el bloque DATABASES en settings.py
+          cat > replace_databases.py << 'PYEOF'
+          import re
+          with open('explatenciasprint4/settings.py') as f:
+              content = f.read()
+          with open('explatenciasprint4/db_config.py') as f:
+              db_conf = f.read()
+          pattern = re.compile(r'DATABASES\s*=\s*\{.*?\}\s*', re.DOTALL)
+          content_new = pattern.sub(db_conf + '\n', content)
+          with open('explatenciasprint4/settings.py', 'w') as f:
+              f.write(content_new)
+          PYEOF
+
+          python3 replace_databases.py
+          rm replace_databases.py
+
+          # Configurar settings.py
+          sed -i "s/^ALLOWED_HOSTS = .*/ALLOWED_HOSTS = ['*']/" explatenciasprint4/settings.py
+
+          # Instalar dependencias de Python
+          pip3 install -r requirements.txt
+          python3 manage.py migrate
+
+          # Ejecutar la aplicación 'patient_manager'
+          python3 manage.py runserver 0.0.0.0:8080
       - key: db-primary-ip
         value: $(ref.vm-db-primary.networkInterfaces[0].networkIP)
       - key: db-replica-ip
